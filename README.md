@@ -20,7 +20,9 @@ The notify client/server implementation is a simple extension to the original `p
 
 ### Client side
 
-* Run the client: `./usbip-notify-client.py`.
+Note: client must be run as `root` to attach/detach the USB device.
+
+* Run the client as `root`: `sudo ./usbip-notify-client.py`.
 
 ## Limitations of the included USBIP implementation (pyusbip)
 
