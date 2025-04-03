@@ -3,7 +3,7 @@
 # Copyright (c) 2025 Kamyar Mohajerani
 #   USBIP server is based on [pyusbip](https://github.com/jwise/pyusbip)
 #       and [this fork](https://github.com/tumayt/pyusbip) by tumayt
-#   Copyright (c) 2018 Joshua Wise
+#     Copyright (c) 2018 Joshua Wise
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,34 +18,35 @@
 # limitations under the License.
 
 import asyncio
+import logging
+import os
+import struct
 import threading
+import time
+import traceback
+from functools import cached_property
 from typing import Tuple
 
 import usb
 import usb.backend
-from usb.core import Device
 from usb.backend.libusb1 import (
     CFUNCTYPE,
     POINTER,
-    c_int,
-    c_void_p,
+    _Device,
     _libusb_device_handle,
-    c_uint,
-    py_object,
     _objfinalizer,
     byref,
-    _Device,
+    c_int,
+    c_uint,
+    c_void_p,
+    py_object,
 )
-
-from functools import cached_property
-from time import sleep
+from usb.core import Device
 import usb1
-import struct
-import traceback
 
 # Configuration
 
-USBIP_HOST = "0.0.0.0"
+USBIP_HOST = "192.168.64.1"
 USBIP_PORT = 3240
 
 NOTIFY_HOST = USBIP_HOST
@@ -54,6 +55,45 @@ NOTIFY_PORT = 65432
 # set both/either to -1 to match any device
 FILTER_VENDOR_ID = 0x0403  # FTDI
 FILTER_PRODUCT_ID = 0x6010  # FT2232C/D/H
+
+notify_log = logging.getLogger("Notify")
+
+usbip_log = logging.getLogger("USBIP")
+
+# set up logging
+# set level to INFO
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(levelname)s] [%(name)s] %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+    ],
+)
+
+
+def parse_args():
+    import argparse
+
+    parser = argparse.ArgumentParser(description="USBIP Notify Server")
+    parser.add_argument(
+        "--usbip-host", type=str, default=USBIP_HOST, help="Address to bind the USBIP server to"
+    )
+    parser.add_argument(
+        "--usbip-port", type=int, default=USBIP_PORT, help="Port number for the USBIP server"
+    )
+    parser.add_argument(
+        "--notify-host",
+        type=str,
+        default=NOTIFY_HOST,
+        help="Address to bind the notification server to",
+    )
+    parser.add_argument(
+        "--notify-port",
+        type=int,
+        default=NOTIFY_PORT,
+        help="Port number for the notification server",
+    )
+    return parser.parse_args()
 
 
 #####################
@@ -102,19 +142,32 @@ USB_ENOENT = 2
 USB_EPIPE = 32
 
 
+def sock_to_str(socketname) -> str:
+    if isinstance(socketname, (tuple, list)):
+        return ":".join(str(x) for x in socketname)
+    else:
+        return str(socketname)
+
+
 # Global USB context
 usbctx = usb1.USBContext()
 usbctx.open()
 
 
-class USBIPUnimplementedException(Exception):
-    def __init__(self, message):
-        self.message = message
+class USBIPException(Exception):
+    pass
 
 
-class USBIPProtocolErrorException(Exception):
-    def __init__(self, message):
-        self.message = message
+class USBIPUnimplementedException(USBIPException):
+    pass
+
+
+class USBIPProtocolErrorException(USBIPException):
+    pass
+
+
+class USBIPProtocolFatalError(USBIPException):
+    pass
 
 
 class USBIPDevice:
@@ -136,19 +189,16 @@ class USBIPConnection:
         self.writer = writer
         self.devices = {}
         self.urbs = {}
+        # usbip_log.name = f"USBIP {self.peername}"
 
     @cached_property
     def peername(self) -> str:
-        addr = self.writer.get_extra_info("peername")
-        if isinstance(addr, tuple):
-            return f"{':'.join(str(x) for x in addr)}"
-        else:
-            return str(addr)
+        return sock_to_str(self.writer.get_extra_info("peername"))
 
     def say(self, msg):
-        print(f"[USBIP {self.peername}]: {msg}")
+        usbip_log.info(msg)
 
-    def pack_device_desc(self, dev, interfaces=True):
+    def pack_device_desc(self, dev: usb1.USBDevice, interfaces=True):
         """Takes a usb1 device and packs it into a struct usb_device (and
         optionally, struct usb_interfaces)."""
 
@@ -177,7 +227,7 @@ class USBIPConnection:
             hnd = dev.open()
             bConfigurationValue = hnd.getConfiguration()
             hnd.close()
-        except Exception:
+        except usb1.USBError:
             bConfigurationValue = configs[0].getConfigurationValue()
         bNumConfigurations = dev.getNumConfigurations()
 
@@ -480,7 +530,7 @@ class USBIPConnection:
             else:
                 raise USBIPProtocolErrorException("bad USBIP op {:x}".format(opcode))
         else:
-            raise USBIPProtocolErrorException("unsupported USBIP version {:02x}".format(version))
+            raise USBIPProtocolFatalError("unsupported USBIP version {:02x}".format(version))
 
         return True
 
@@ -495,7 +545,7 @@ class USBIPConnection:
                     break
             except Exception as e:
                 traceback.print_exc()
-                self.say("force disconnect due to exception")
+                self.say(f"forcing disconnect due to exception: {e}")
                 break
 
         self.say("disconnect")
@@ -628,7 +678,7 @@ def handle_device_event(dev: Device, event, user_data):
             avail_devices.remove(dev_id)
     else:
         event_str = str(event)
-    print(
+    usbip_log.info(
         # f">> USB {get_usb_version_str(dev)} device {dev._str()} event:{event_str}"
         f">> USB {get_usb_version_str(dev)} device {dev.idVendor:04x}:{dev.idProduct:04x} on {dev_id}, event: {event_str}"  # type: ignore
     )
@@ -638,10 +688,10 @@ def handle_device_event(dev: Device, event, user_data):
             if event in (USB_EVENT_PLUGGED, USB_EVENT_UNPLUGGED):
                 write_event(notify_socket, dev_id, event_str)
         except Exception as e:
-            print(f"Exception {e} during write to notify socket")
+            notify_log.error(f"Exception {e} during write to notify socket")
             pass
     else:
-        print("No clients connected! (notify_socket is None)")
+        notify_log.error("No clients connected! (notify_socket is None)")
     return 0
 
 
@@ -651,27 +701,28 @@ def write_event(socket: asyncio.StreamWriter, dev_id, event):
 
 async def notify_connected_cb(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
     addr = writer.get_extra_info("peername")
-    print(f">> connection from {addr!r}")
-    # print(f"New notify client")
+    notify_log.info(f"connection from {addr!r}")
     global notify_socket
     notify_socket = writer
     data = await reader.read(100)  # Max number of bytes to read
     # if not data:
-    print(f"> received hello rom {addr!r}")
+    notify_log.info(f"received hello from client {addr!r}")
     if data != b"Client hello":
-        print("Unexpected message from client")
+        notify_log.error(f"!!! Unexpected message from client {addr!r}: {data!r}")
         # await writer.drain()
         writer.close()
         return
     # global avail_devices
-    usb_devices = usb.core.find(
-        idVendor=FILTER_VENDOR_ID, idProduct=FILTER_PRODUCT_ID, find_all=True
-    )
+    filter_args = {}
+    if isinstance(FILTER_VENDOR_ID, int) and FILTER_VENDOR_ID > 0:
+        filter_args["idVendor"] = FILTER_VENDOR_ID
+    if isinstance(FILTER_PRODUCT_ID, int) and FILTER_PRODUCT_ID > 0:
+        filter_args["idProduct"] = FILTER_PRODUCT_ID
+    usb_devices = usb.core.find(find_all=True, **filter_args)
     if usb_devices is None:
         usb_devices = []
     usb_devices = list(usb_devices)
-    print(f"usb_devices: {usb_devices}")
-    print(f"Found {len(usb_devices)} devices")
+    usbip_log.info(f"Found {len(usb_devices)} devices")
     for dev in usb_devices:
         if isinstance(dev, Device):
             dev_id = f"{dev.bus}-{dev.address}"
@@ -681,8 +732,8 @@ async def notify_connected_cb(reader: asyncio.StreamReader, writer: asyncio.Stre
         data = await reader.read(100)
         if not data:
             break
-        print(f"{addr} -> {data} {reader.at_eof()}")
-    print("end of serving")
+        usbip_log.debug(f"{addr} -> {data!r} {reader.at_eof()}")
+    usbip_log.info(f"> closing connection from {addr!r}")
     writer.close()
 
 
@@ -693,22 +744,17 @@ handle = _HotplugHandle(
 
 def get_socket_name(server: asyncio.Server) -> str:
     assert server is not None
-    socket_name = server.sockets[0].getsockname()
-    if isinstance(socket_name, tuple):
-        return ":".join(str(x) for x in socket_name)
-    else:
-        return str(socket_name)
+    return sock_to_str(server.sockets[0].getsockname())
 
 
 async def start_notify_server():
-    try:
-        server = await asyncio.start_server(notify_connected_cb, NOTIFY_HOST, NOTIFY_PORT)
-    except OSError as e:
-        print(f" [FAILED]")
-        print(f"{e.strerror}")
-        return
+    # try:
+    server = await asyncio.start_server(notify_connected_cb, NOTIFY_HOST, NOTIFY_PORT)
+    # except OSError as e:
+    #     notify_log.critical(f"start_server failed: {e.strerror}")
+    #     return
     async with server:
-        print(f"[NotifyServer] Serving on {get_socket_name(server)}")
+        notify_log.info(f"Serving on {get_socket_name(server)}")
         await server.serve_forever()
 
 
@@ -716,35 +762,31 @@ def usb_event_loop(handle: _HotplugHandle, stop_event: threading.Event):
     while not stop_event.is_set():
         r = handle.handle_events()
         if r != 0:
-            print(f"[usb_event_loop] libusb_handle_events returned {r}")
+            usbip_log.error(f"[usb_event_loop] libusb_handle_events returned {r}")
             return
 
 
 async def usb_event_handler(handle, stop_event):
-    print("Handling USB events...")
+    usbip_log.info("Handling USB events...")
     return await asyncio.to_thread(usb_event_loop, handle, stop_event)
 
 
 async def uspip_server():
-    # print(f"[USBIP] Starting server on {USBIP_HOST}:{USBIP_PORT}")
-    try:
-        server = await asyncio.start_server(usbip_connection, USBIP_HOST, USBIP_PORT)
-    except OSError as e:
-        print(f"Failed to start USBIP server on {USBIP_HOST}:{USBIP_PORT}: {e.strerror}")
-        return
+    usbip_log.debug(f"Starting server on {USBIP_HOST}:{USBIP_PORT}")
+    server = await asyncio.start_server(usbip_connection, USBIP_HOST, USBIP_PORT)
     async with server:
-        print(f"[USBIP] Serving on {get_socket_name(server)}")
+        usbip_log.info(f"Serving on {get_socket_name(server)}")
         return await server.serve_forever()
 
 
 def usb_added(fd, events):
-    print("adding fd {} for {}".format(fd, events))
+    usbip_log.info("adding fd {} for {}".format(fd, events))
     loop = asyncio.get_running_loop()
     loop.add_reader(fd, lambda: usbctx.handleEventsTimeout())
 
 
 def usb_removed(fd, events):
-    print("removing fd {} for {}".format(fd, events))
+    usbip_log.info("removing fd {} for {}".format(fd, events))
     loop = asyncio.get_running_loop()
     loop.remove_reader(fd)
 
@@ -753,45 +795,86 @@ async def main(stop_event: threading.Event):
     for fd, events in usbctx.getPollFDList():
         usb_added(fd, events)
     usbctx.setPollFDNotifiers(usb_added, usb_removed)
-    async with asyncio.TaskGroup() as tg:
-        usbip_task = tg.create_task(uspip_server())
-        assert usbip_task is not None
-        usbip_task.add_done_callback(lambda _: (print("usbip_task done"), stop_event.set()))
-        await asyncio.sleep(0.1)
-        notif_server_task = tg.create_task(start_notify_server())
-        assert notif_server_task is not None
-        notif_server_task.add_done_callback(
-            lambda _: (print("notif_server_task done"), stop_event.set(), usbip_task.cancel())
-        )
-        usbip_task.add_done_callback(lambda _: usbip_task.cancel())
-        await asyncio.sleep(0.1)
-        usb_task = tg.create_task(usb_event_handler(handle, stop_event))
-        assert usb_task is not None
-        usb_task.add_done_callback(
-            lambda _: (
-                print(f"usb_task done cancelled={usb_task.cancelled()}"),
-                stop_event.set(),
-                usbip_task.cancel(),
-                notif_server_task.cancel(),
-                handle.deregister(),
+    try:
+        async with asyncio.TaskGroup() as tg:
+            usbip_task = tg.create_task(uspip_server())
+
+            assert usbip_task is not None
+            usbip_task.add_done_callback(lambda _: stop_event.set())
+            try:
+                await asyncio.sleep(0.1)
+            except asyncio.exceptions.CancelledError:
+                return
+            notif_server_task = tg.create_task(start_notify_server())
+            assert notif_server_task is not None
+            notif_server_task.add_done_callback(
+                lambda _: (print("notif_server_task done"), stop_event.set(), usbip_task.cancel())
             )
-        )
+            usbip_task.add_done_callback(lambda _: usbip_task.cancel())
+            try:
+                await asyncio.sleep(0.1)
+            except asyncio.exceptions.CancelledError:
+                return
+            usb_task = tg.create_task(usb_event_handler(handle, stop_event))
+            assert usb_task is not None
+            usb_task.add_done_callback(
+                lambda _: (
+                    # print(f"usb_task done cancelled={usb_task.cancelled()}"),
+                    stop_event.set(),
+                    usbip_task.cancel(),
+                    notif_server_task.cancel(),
+                    handle.deregister(),
+                )
+            )
+    except ExceptionGroup as eg:
+        for e in eg.exceptions:
+            if not isinstance(e, asyncio.CancelledError):
+                raise e
 
 
 if __name__ == "__main__":
+    args = parse_args()
+    USBIP_HOST = args.usbip_host
+    USBIP_PORT = args.usbip_port
+    NOTIFY_HOST = args.notify_host
+    NOTIFY_PORT = args.notify_port
+
+    # check running as root
+    if os.geteuid() != 0:
+        usbip_log.critical("This script must be run as root.")
+        exit(1)
+
     stop_event = threading.Event()
-    try:
-        asyncio.run(main(stop_event))
-    except KeyboardInterrupt:
-        print("[__main__] Received KeyboardInterrupt")
+
+    def cleanup_and_exit(exit_val):
+        usbip_log.info("Cleaning up and exiting...")
         stop_event.set()
-        print("Cleaning up...")
-        handle.deregister()
+        try:
+            handle.deregister()
+            handle.deregister()
+        except Exception as e:
+            notify_log.error(f"Error during deregister: {e}")
+            pass
         try:
             asyncio.get_event_loop().stop()
         except RuntimeError:
+            notify_log.debug("Event loop already stopped")
             pass
-        exit(1)
-    finally:
-        handle.deregister()
-        print("Done")
+        usbctx.setPollFDNotifiers(None, None)
+        usbctx.close()
+        exit(exit_val)
+
+    while True:
+        try:
+            asyncio.run(main(stop_event))
+        except KeyboardInterrupt:
+            usbip_log.info("KeyboardInterrupt, exiting...")
+            cleanup_and_exit(0)
+        except OSError as e:
+            usbip_log.info("%s", e.strerror)
+            cleanup_and_exit(0)
+        except USBIPProtocolErrorException as e:
+            usbip_log.error(f"[__main__] USBIPProtocolError: {e}")
+        finally:
+            stop_event.set()
+        time.sleep(3)

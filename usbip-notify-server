@@ -1,0 +1,25 @@
+#!/bin/sh
+
+# This script is used to start usbip-notify-server.py
+
+SCRIPT_DIR="$(cd "$(dirname $(realpath "$0"))" && pwd)"
+
+# initialize virtualenv environment if does not exist:
+
+
+VENV_DIR="$SCRIPT_DIR/.venv"
+BIN_DIR="$VENV_DIR/bin"
+
+if [ ! -d "$VENV_DIR" ]; then
+    python3 -m venv "$VENV_DIR"
+    # activate virtualenv
+    source "$BIN_DIR/activate"
+    # install dependencies
+    "$BIN_DIR/pip" install -r "$SCRIPT_DIR/requirements.txt"
+else
+    source "$BIN_DIR/activate"
+fi
+
+[ -z "$SUDO" ] && SUDO=sudo
+
+"$SUDO" "$BIN_DIR/python3" "$SCRIPT_DIR/usbip-notify-server.py" "$@"

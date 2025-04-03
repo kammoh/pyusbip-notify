@@ -14,20 +14,44 @@
 # limitations under the License.
 
 import asyncio
+import os
 import re
 import subprocess
+import time
 from typing import Optional
 
 SOCKET_HOST = "192.168.64.1"
 SOCKET_PORT = 65432
 
+MAX_FAILURES = 1_000
+
+
+def parse_args():
+    import argparse
+
+    parser = argparse.ArgumentParser(description="USBIP Notify Client")
+    parser.add_argument("--host", type=str, default=SOCKET_HOST, help="Notify server host address")
+    parser.add_argument("--port", type=int, default=SOCKET_PORT, help="Notify server port number")
+    parser.add_argument(
+        "--max-failures",
+        type=int,
+        default=MAX_FAILURES,
+        help="Maximum number of failures before exiting",
+    )
+    parser.add_argument(
+        "--no-modprobe",
+        action="store_true",
+        help="Do not run modprobe vhci-hcd",
+    )
+    args = parser.parse_args()
+    return args
+
 
 def run_command(*cmd, get_stdout=False, check=False):
-    print(f"> running {' '.join(cmd)}\n", flush=True)
+    print(f"> running {' '.join(cmd)}", flush=True)
     try:
         result = subprocess.run(cmd, stdout=subprocess.PIPE if get_stdout else None, check=check)
-        if result.returncode != 0:
-            print(f"[ERROR] `{' '.join(cmd[:2])}` returned {result.returncode}")
+        print(f">  `{' '.join(cmd[:2])}` returned {result.returncode}")
         return result
     except FileNotFoundError as e:
         print(f"Failed to run {' '.join(cmd)}. {e.filename} command was not found!")
@@ -35,7 +59,6 @@ def run_command(*cmd, get_stdout=False, check=False):
 
 
 def run_command_get_output(*cmd, check=True):
-    print(f"> running {' '.join(cmd)}\n", flush=True)
     res = run_command(*cmd, get_stdout=True, check=check)
     if res is None:
         return (None, -999)
@@ -49,6 +72,10 @@ def list_ports():
         return parse_ports(output)
     return None
     # TODO parse output
+
+
+class ConnectionClosedError(Exception):
+    pass
 
 
 def parse_ports(output):
@@ -77,10 +104,10 @@ def parse_ports(output):
 class NotifyClient(asyncio.Protocol):
     message = "Client hello"
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.transport: Optional[asyncio.Transport] = None
 
-    def connection_made(self, transport: asyncio.Transport):
+    def connection_made(self, transport: asyncio.Transport):  # type: ignore
         print(f"* Connected to {transport.get_extra_info('peername')}")
         self.transport = transport
         assert self.transport is not None
@@ -114,6 +141,11 @@ class NotifyClient(asyncio.Protocol):
     def connection_lost(self, exc):
         print("* server closed the connection")
         asyncio.get_event_loop().stop()
+        if exc is not None:
+            print(f"[ERROR] {exc}")
+            raise exc
+        else:
+            raise ConnectionClosedError()
 
 
 test_output = """
@@ -132,17 +164,55 @@ Port 01: <Port in Use> at High Speed(480Mbps)
 # print(parse_ports(test_output))
 
 if __name__ == "__main__":
-    run_command("modprobe", "vhci-hcd", check=True)
+    args = parse_args()
+    SOCKET_HOST = args.host
+    SOCKET_PORT = args.port
+    MAX_FAILURES = args.max_failures
+
+    # check if running as root
+    if os.geteuid() != 0:
+        print("This script must be run as root")
+        exit(1)
+
+    if not args.no_modprobe:
+        run_command("modprobe", "vhci-hcd", check=True)
+
+    num_failures = 0
+    had_success = False
 
     loop = asyncio.new_event_loop()
     print(f"* Connecting to server {SOCKET_HOST}:{SOCKET_PORT}")
-    coro = loop.create_connection(NotifyClient, SOCKET_HOST, SOCKET_PORT)
 
-    try:
-        loop.run_until_complete(coro)
-    except ConnectionRefusedError as e:
-        print(f"[ERROR] Connection refused: {e}")
-        loop.stop()
-        exit(1)
-    loop.run_forever()
-    loop.close()
+
+    while True:
+        try:
+            coro = loop.create_connection(NotifyClient, SOCKET_HOST, SOCKET_PORT)
+            loop.run_until_complete(coro)
+            loop.run_forever()
+        except KeyboardInterrupt:
+            print("\nExiting...")
+            exit(0)
+        except ConnectionRefusedError as e:
+            print(f"[ERROR] Connection refused: {e}")
+            num_failures += 1
+            max_fails = MAX_FAILURES if had_success else 10
+            if num_failures >= max_fails:
+                print(f"[ERROR] Giving up connecting after {num_failures} attempts")
+                loop.close()
+                exit(1)
+            t = min(20, num_failures)
+            print(f"Waiting {t} seconds before retrying...")
+            time.sleep(t)
+            continue
+        except ConnectionClosedError:
+            num_failures += 1
+            if num_failures >= MAX_FAILURES:
+                print(f"[ERROR] Giving up reconnecting after {num_failures} attempts")
+                loop.close()
+                exit(1)
+            t = min(15, num_failures // 3 + 2)
+            print(f"Waiting {t} seconds before reconnecting...")
+            time.sleep(t)
+            continue
+        else:
+            had_success = True

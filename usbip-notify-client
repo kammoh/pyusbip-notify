@@ -1,0 +1,7 @@
+#!/bin/sh
+
+# SCRIPT_DIR="$(cd "$(dirname $(realpath "$0"))" && pwd)"
+
+[ -z "$SUDO" ] && SUDO=sudo
+
+"$SUDO" "${0}.py" "$@"
