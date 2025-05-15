@@ -175,7 +175,7 @@ if __name__ == "__main__":
         exit(1)
 
     if not args.no_modprobe:
-        run_command("modprobe", "vhci-hcd", check=True)
+        run_command("modprobe", "vhci-hcd", check=False)
 
     num_failures = 0
     had_success = False

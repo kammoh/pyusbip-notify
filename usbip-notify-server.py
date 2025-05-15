@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-
 # Copyright (c) 2025 Kamyar Mohajerani
 #   USBIP server is based on [pyusbip](https://github.com/jwise/pyusbip)
 #       and [this fork](https://github.com/tumayt/pyusbip) by tumayt
@@ -16,6 +15,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "libusb1~=3.2",
+#     "pyusb~=1.3",
+# ]
+# ///
+#
+
 
 import asyncio
 import logging
@@ -54,7 +63,7 @@ NOTIFY_PORT = 65432
 
 # set both/either to -1 to match any device
 FILTER_VENDOR_ID = 0x0403  # FTDI
-FILTER_PRODUCT_ID = 0x6010  # FT2232C/D/H
+FILTER_PRODUCT_ID = -1 # FT2232C/D/H
 
 notify_log = logging.getLogger("Notify")
 
@@ -84,7 +93,7 @@ def parse_args():
     parser.add_argument(
         "--notify-host",
         type=str,
-        default=NOTIFY_HOST,
+        default=None,
         help="Address to bind the notification server to",
     )
     parser.add_argument(
@@ -93,7 +102,22 @@ def parse_args():
         default=NOTIFY_PORT,
         help="Port number for the notification server",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--vendor-id",
+        type=int,
+        default=FILTER_VENDOR_ID,
+        help=f"Vendor ID to filter devices (default: {FILTER_VENDOR_ID})",
+    )
+    parser.add_argument(
+        "--product-id",
+        type=int,
+        default=FILTER_PRODUCT_ID,
+        help=f"Product ID to filter devices (default: {FILTER_PRODUCT_ID})",
+    )
+    args = parser.parse_args()
+    if args.notify_host is None:
+        args.notify_host = args.usbip_host
+    return args
 
 
 #####################
@@ -838,11 +862,13 @@ if __name__ == "__main__":
     USBIP_PORT = args.usbip_port
     NOTIFY_HOST = args.notify_host
     NOTIFY_PORT = args.notify_port
+    FILTER_VENDOR_ID = args.vendor_id
+    FILTER_PRODUCT_ID = args.product_id
 
     # check running as root
     if os.geteuid() != 0:
         usbip_log.critical("This script must be run as root.")
-        exit(1)
+        # exit(1)
 
     stop_event = threading.Event()
 
